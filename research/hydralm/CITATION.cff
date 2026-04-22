@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use HydraLM in your research, please cite it as below."
+title: "HydraLM: A Sub-Quadratic Language Model Combining Gated DeltaNet with Sparse Sliding-Window Attention"
+version: "0.2.0"
+date-released: "2026-04-21"
+license: MIT
+type: software
+repository-code: "https://github.com/byte271/hydralm"
+url: "https://github.com/byte271/hydralm"
+authors:
+  - name: "cyh"
+keywords:
+  - language model
+  - linear attention
+  - gated deltanet
+  - sliding window attention
+  - state space model
+  - long context
+  - pytorch
+preferred-citation:
+  type: software
+  title: "HydraLM: A Sub-Quadratic Language Model Combining Gated DeltaNet with Sparse Sliding-Window Attention"
+  authors:
+    - name: "cyh"
+  year: 2026
+  version: "0.2.0"
+  url: "https://github.com/byte271/hydralm"

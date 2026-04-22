@@ -1,0 +1,90 @@
+[project]
+name = "hydralm"
+version = "0.2.0"
+description = "HydraLM: a sub-quadratic language model combining Gated DeltaNet with sparse sliding-window attention."
+readme = "RESULTS.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "cyh" },
+]
+maintainers = [
+    { name = "cyh" },
+]
+keywords = [
+    "language-model",
+    "transformer",
+    "linear-attention",
+    "gated-deltanet",
+    "sliding-window-attention",
+    "state-space-model",
+    "long-context",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2",
+    "einops>=0.7",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-xdist>=3.5",
+    "matplotlib>=3.8",
+    "ruff>=0.5",
+]
+train = [
+    "datasets>=2.16",
+    "tokenizers>=0.15",
+    "tqdm>=4.66",
+    "wandb>=0.16",
+]
+hf = [
+    "transformers>=4.40",
+]
+
+[project.urls]
+Homepage = "https://github.com/byte271/hydralm"
+Repository = "https://github.com/byte271/hydralm"
+Issues = "https://github.com/byte271/hydralm/issues"
+Changelog = "https://github.com/byte271/hydralm/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/byte271/hydralm/tree/main/docs"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hydralm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: marks tests as slow (opt-in with -m slow)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = ["E501"]

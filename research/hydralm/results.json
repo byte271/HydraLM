@@ -1,0 +1,145 @@
+{
+  "passed": true,
+  "results": [
+    {
+      "name": "claim_1_linear_complexity",
+      "title": "Linear Complexity O(N)",
+      "passed": true,
+      "thresholds": {
+        "hydra_slope_in": [
+          0.95,
+          1.05
+        ],
+        "transformer_slope_gt": 1.5,
+        "sampled_N": [
+          1024,
+          4194304
+        ]
+      },
+      "measured": {
+        "hydra_slope": 0.9999999999999999,
+        "transformer_slope": 1.9832198600707687
+      },
+      "notes": "13 log-spaced sample points from 2^10 to 2^22"
+    },
+    {
+      "name": "claim_2_lossless_mqar",
+      "title": "Lossless Accuracy on MQAR",
+      "passed": true,
+      "thresholds": {
+        "transformer_floor": 0.5,
+        "ratio_ge": 0.9
+      },
+      "measured": {
+        "hydra_accuracy": 0.99609375,
+        "transformer_accuracy": 0.5390625,
+        "ratio": 1.8478260869565217
+      },
+      "notes": "steps=2000, bs=32, seq_len=32, D=2, Q=1, vocab=64"
+    },
+    {
+      "name": "claim_3_constant_state",
+      "title": "1M-10M Token Streaming (Constant State)",
+      "passed": true,
+      "thresholds": {
+        "state_bytes_constant": true,
+        "runtime_finite_step": true,
+        "N_probed": [
+          1024,
+          1048576,
+          10485760,
+          104857600
+        ]
+      },
+      "measured": {
+        "state_bytes_at_sizes": {
+          "1024": 24576.0,
+          "1048576": 24576.0,
+          "10485760": 24576.0,
+          "104857600": 24576.0
+        },
+        "state_bytes_unique_values": 1,
+        "runtime_ok": true
+      },
+      "notes": "runtime probe: prefill 4096 + 512 single-token steps"
+    },
+    {
+      "name": "claim_4_cost_reduction",
+      "title": "90% Cost Reduction at Long Context",
+      "passed": true,
+      "thresholds": {
+        "flop_save_ge_at_N": [
+          0.9,
+          131072
+        ],
+        "mem_save_ge_at_N": [
+          0.9,
+          131072
+        ],
+        "monotone_in_N": [
+          16384,
+          1048576
+        ]
+      },
+      "measured": {
+        "flop_save": 0.9979082047116166,
+        "mem_save": 0.99981689453125,
+        "flop_save_at_small": 0.9834724005134788,
+        "flop_save_at_large": 0.9997381160628929,
+        "dollar_save": 0.9979082047116166
+      },
+      "notes": "N=131,072, small=16,384, large=1,048,576"
+    },
+    {
+      "name": "claim_5_drop_in",
+      "title": "Drop-in Transformer Replacement",
+      "passed": true,
+      "thresholds": {
+        "api_parity": true,
+        "param_ratio_in": [
+          0.9,
+          1.1
+        ],
+        "hf_generate_works": true
+      },
+      "measured": {
+        "api_ok": true,
+        "param_hydra": 241168,
+        "param_transformer": 230016,
+        "param_ratio": 0.9537583759039342,
+        "hf_generate_ok": true
+      },
+      "notes": "batch=2, seq=16, new_tokens=8"
+    },
+    {
+      "name": "claim_6_online_learning",
+      "title": "Zero-Gradient Test-Time Learning",
+      "passed": true,
+      "thresholds": {
+        "argmax_ge_at_N": [
+          0.99,
+          1000
+        ],
+        "overwrite_margin_ge": 0.5,
+        "no_grad_writes": true,
+        "kv_ratio_ge": [
+          100.0,
+          10000
+        ]
+      },
+      "measured": {
+        "argmax_accuracy": 1.0,
+        "cosine": 0.6808836460113525,
+        "cosine_min": 0.36485254764556885,
+        "factbank_bytes": 16777216,
+        "overwrite_margin": 0.8084572851657867,
+        "cos_to_new": 0.8899003267288208,
+        "cos_to_old": 0.08144304156303406,
+        "no_grad_writes": true,
+        "transformer_kv_bytes": 62914560000,
+        "kv_ratio": 3750.0
+      },
+      "notes": "N=1000 facts @ d=1024, H=4; KV baseline: 10,000 facts across 12 layers x 16 tokens/fact"
+    }
+  ]
+}
