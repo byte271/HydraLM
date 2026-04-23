@@ -15,11 +15,28 @@ A 16-bit floating-point format with the same 8-bit exponent as fp32
 but only 7 bits of mantissa. Trades precision for range, making it
 the preferred mixed-precision dtype on Ampere+ GPUs.
 
+### Chunk-sparse attention
+
+Softmax attention restricted to a small, dynamically selected subset
+of past chunks rather than the entire past. In HydraLM, implemented
+by `RetrievalAttention`: each query chunk scores past-chunk summary
+vectors, picks the top-`k`, and attends over only those chunks plus
+the local chunk. Gives sub-quadratic cost while preserving exact
+attention within each selected chunk.
+
+### Compressive memory
+
+A three-tier KV-stream wrapper (`CompressiveMemory`) used to bound
+the memory of a softmax-attention layer under unbounded streaming:
+an *exact window* of the most recent tokens, a *compressed pool* of
+older tokens pooled into learned summaries, and a *tombstone* for
+anything older than that. Appears at `hydralm.modules.compressive_memory`.
+
 ### CUDA graph
 
 A recorded sequence of CUDA operations that can be replayed with near
 zero launch overhead. Enabled implicitly by
-`compile_for_inference(..., mode="reduce-overhead")`.
+`CompiledDecoder(model, compile=True)` when `torch.compile` succeeds.
 
 ### Delta rule
 
@@ -79,6 +96,25 @@ Multi-Query Associative Recall. A synthetic benchmark in which a
 sequence of `(key, value)` pairs is followed by queries; the model
 must retrieve the correct value for each. See `docs/evaluation.md`.
 
+### MTP
+
+Multi-Token Prediction (DeepSeek-V3 §2.3). An auxiliary training
+objective that asks the model to predict the next `depth` tokens in
+parallel from each backbone hidden state, via a small stack of
+residual blocks with tied LM projections. Implemented as
+`MultiTokenPredictor` / `MTPBlock` in `hydralm.modules.mtp_head`;
+enabled via `cfg.mtp_depth > 0`. Doubles as a zero-extra-parameter
+draft path for speculative decoding.
+
+### Multi-fact long-context QA
+
+An evaluation harness (`hydralm.eval.retrieval_qa`) where a long
+sequence contains `K` `(key, value)` facts at randomised depths and
+a trailing block of `Q` queries; the model must answer each query by
+retrieving the value for a specified key. Stresses *natural*
+information extraction far more aggressively than the single-needle
+benchmark.
+
 ### Muon
 
 An optimizer that uses Newton-Schulz orthogonalization on the
@@ -97,6 +133,17 @@ A residual-block layout where normalization is applied to the input
 of each sublayer rather than the output. Produces more stable
 training dynamics than the original post-norm Transformer.
 
+### RAA
+
+Retrieval-Augmented Attention. The 0.3.0 sequence-mixing layer that
+implements chunk-sparse top-`k` softmax attention. Unlike SWA
+(exact-but-local) and DeltaNet (constant-state-but-lossy), RAA gives
+exact softmax attention over a dynamically selected, content-addressed
+subset of past chunks, enabling natural long-range information
+extraction. Implemented as `RetrievalAttention` in
+`hydralm.modules.retrieval_attention`; enabled via
+`cfg.retrieval_every > 0`.
+
 ### RMSNorm
 
 Root Mean Square Layer Normalization (Zhang & Sennrich, 2019). The
@@ -107,6 +154,14 @@ only normalization used in HydraLM.
 Rotary Position Embedding (Su et al., 2021). Encodes positions as
 rotations of query/key vector pairs; the only positional encoding
 used in HydraLM's SWA layers.
+
+### Routing summary / summary vector
+
+The per-chunk feature vector used by `RetrievalAttention` to decide
+which past chunks to attend to. By default it is the mean of the
+chunk's keys (keys side) or queries (query side); setting
+`retrieval_learned_summary=True` replaces the mean with a small
+trained linear head.
 
 ### Short convolution
 
@@ -154,6 +209,15 @@ A 1.1 MB text file of Shakespeare's collected works, bundled as
 The standard throughput metric for autoregressive generation. In this
 repository always measured with `torch.cuda.Event`, batch size 1,
 after a 20-token warmup.
+
+### Top-k routing
+
+The step inside `RetrievalAttention` that scores every past chunk's
+summary against the current query chunk's summary and selects the
+`retrieval_top_k` highest-scoring past chunks for the subsequent
+softmax attention. Done at chunk granularity so that queries inside
+the same chunk share a retrieved set — this is what makes the cost
+sub-quadratic.
 
 ### W (`swa_window`)
 

@@ -4,170 +4,160 @@
 
 ### Is HydraLM production-ready?
 
-HydraLM is a **research reference implementation**. The code is
-clean, tested, and numerically stable, but it has not been hardened
-for multi-tenant serving and has no first-party quantization path.
-For production, we recommend either:
+HydraLM is a **research reference implementation**. The code is clean,
+tested, and useful for experimentation, but it is not a full serving
+platform. Think of it as:
 
-- Training a model with HydraLM and exporting it to Hugging Face via
-  `hydralm.deploy.hf_adapter.export_to_hf`, then serving it with
-  `vllm` / `sglang` / `TGI`.
-- Using the exposed nn.Modules directly inside your own framework
-  (Lightning, nanotron, torchtitan) and treating HydraLM as a layer
-  library rather than a training stack.
+- a model implementation
+- a small training stack
+- evaluation and reproducibility harnesses
+- deployment-facing helpers such as `StreamingEngine`, `CompiledDecoder`,
+  and `HydraLMForCausalLM`
 
-### Why hybrid? Why not just Transformer or just Mamba?
+### Why hybrid instead of pure Transformer or pure linear attention?
 
-See `docs/architecture.md` §1 and `docs/theory.md` §5. The short
-answer: pure linear-attention models have capacity-bounded state
-that caps their recall; pure softmax Transformers have
-unbounded-memory inference cost. A small number of SWA layers
-restores local recall at negligible compute cost.
+Because the tradeoff is the point:
 
-### Does HydraLM use flash-attention?
+- DeltaNet gives the backbone a fast recurrent path.
+- SWA restores exact local recall.
+- Retrieval Attention adds sparse long-range access when local recall is not enough.
 
-Not yet. The SWA layer is a plain PyTorch implementation that is
-*correct* but not *maximally fast*. Flash-attention 3 support is on
-the roadmap (`docs/roadmap.md`). For current inference throughput
-this is rarely a bottleneck because the window is small (256 tokens
-by default), so the attention is already cache-friendly.
+The goal is to preserve the scaling benefits of linear-style sequence
+modeling without giving up precise recall everywhere.
 
----
+### How do I extract a specific fact from a very long context?
+
+Enable Retrieval Attention:
+
+```python
+cfg = HydraConfig(
+    ...,
+    retrieval_every=3,
+    retrieval_chunk_size=128,
+    retrieval_top_k=8,
+)
+```
+
+For very long streaming workloads, pair the retrieval path with
+`CompressiveMemory` if you need bounded-memory serving behavior.
+
+### When should I use DeltaNet, SWA, Retrieval, or the FactBank?
+
+| Mechanism | Best for | Cost profile |
+| --- | --- | --- |
+| DeltaNet | Fast backbone dynamics and long-range gist | Recurrent, bounded state |
+| SWA | Exact local recall within a fixed recent window | Window-bounded softmax |
+| Retrieval | Pulling relevant distant chunks into view | Sparse long-range softmax |
+| FactBank | Explicit out-of-band memory you write/query yourself | External key-value memory |
+
+### What's the overhead of enabling MTP?
+
+At training time, enabling `mtp_depth > 0` adds an auxiliary next-k
+prediction head and produces `out["mtp_aux_loss"]` when
+`compute_mtp=True`.
+
+At inference time, there is no extra cost unless you explicitly use the
+MTP path, for example during self-drafting speculative decoding.
 
 ## Training
 
-### I get NaNs after a few hundred steps. What's wrong?
+### What trainer config class should I use?
 
-In order of likelihood:
+Use `TrainingConfig` from `hydralm.training.trainer`, not `TrainerConfig`.
 
-1. **fp16 in the delta-rule path.** The accumulator `S` must be fp32.
-   Do not wrap the model in a `torch.autocast(dtype=torch.float16)`
-   context. Use `precision="bfloat16"` or `"float32"` in
-   `TrainerConfig`.
-2. **Learning rate too high at warmup end.** Default is 3e-4; try
-   1e-4 if you have a small batch size.
-3. **Gradient clipping disabled.** Always use `grad_clip >= 1.0`.
+### Is Muon the default optimizer?
 
-### Training is much slower than I expected.
+Not in the built-in trainer. `TrainingConfig.optimizer` defaults to
+`"adamw"`. Set it to `"muon"` to use the hybrid Muon + AdamW path.
 
-Checklist:
+### How do I reload a native checkpoint?
 
-- Did you set `compile=True` in `TrainerConfig`? First iteration will
-  be slow; steady state should be ~85% MFU on A100.
-- Are you on PyTorch ≥ 2.4? Earlier versions miss essential
-  `torch.compile` fixes for the delta-rule path.
-- Are you using `precision="bfloat16"`? fp32 is ~2.5× slower.
-- Are you packing sequences to the configured `seq_len`? Short
-  sequences leave the GPU idle.
+Native trainer checkpoints are `.pt` files. Recreate the config, build
+`HydraLM(cfg)`, then load `state["model"]`:
 
-### Can I fine-tune a published HydraLM checkpoint?
+```python
+state = torch.load("checkpoints/step_2000.pt", map_location="cpu", weights_only=True)
+model = HydraLM(cfg)
+model.load_state_dict(state["model"])
+```
 
-Yes — `HydraLM.from_pretrained(...)` returns an ordinary `nn.Module`
-that you can plug into any training loop. The architecture is
-unchanged during fine-tuning, so no special handling is needed.
+There is no `HydraLM.from_pretrained(...)` method in the current codebase.
 
-### What is the recommended batch size?
+### Does the trainer support distributed execution?
 
-At `d_model=768`, `seq_len=2048`, bfloat16, on an A100 80GB: global
-batch of 512k tokens (e.g. 64 seqs × 2048 × 4 grad accum × 1 GPU) is
-a good default. Scale linearly with GPU count.
+Yes. The built-in trainer can wrap the model in FSDP when launched under
+distributed execution and `use_fsdp=True`.
 
----
+## Inference and deployment
 
-## Inference
+### What's the simplest inference path?
 
-### Why is the first token slow?
+Use `hydralm.generate(...)` with a prompt tensor and `max_new_tokens`.
 
-`torch.compile` plus CUDA-graph capture happens on the first call
-inside `compile_for_inference`. Warm up by emitting a dummy token
-before measuring.
+### How do I process a very long prompt?
 
-### How do I clear state between requests in a server?
+Use `StreamingEngine`:
 
-Pass `state=None` to `generate` / `stream` / `step_fn` for each new
-request. State is not mutated by the functions you call; you get a
-new state dict back that you can discard.
+- `process(...)` for prefill-only stats
+- `stream(...)` if you need per-chunk logits
+- `extend_and_generate(...)` for prefill plus decode
 
-### Can I run a 160M HydraLM on CPU?
+### Why is the first compiled decode slower?
 
-Yes, but you will not be happy. Expect ~1–2 tok/s because neither
-the delta-rule kernel nor PyTorch's attention primitives are CPU-
-optimized. A single consumer GPU (RTX 3060 or better) will be
-≥50× faster.
+If you use `CompiledDecoder(model, compile=True)`, the first decode round
+may pay compilation overhead. That is expected.
 
-### Does HydraLM support batched inference with different prompt
-lengths?
+### How do I clear state between requests?
 
-Yes, via left-padding and an attention mask. For best throughput we
-recommend bucketing requests into lanes of similar length and
-compiling one `step_fn` per bucket.
+- `generate(...)` handles its own state internally.
+- `StreamingEngine` starts fresh when you create a new engine or call it
+  with a new prompt.
+- `CompiledDecoder` stores state inside each `Request`, so starting a new
+  request means creating a new `Request` object.
 
----
+### Can I batch requests with different prompt lengths?
 
-## Deployment
+Not in a single `CompiledDecoder.prefill(...)` batch. Bucket requests by
+prompt length before prefill so the SWA caches align cleanly.
 
-### How do I quantize a HydraLM model?
+### Is there a HuggingFace-compatible wrapper?
 
-Standard PyTorch quantization libraries work out of the box because
-HydraLM is pure `nn.Module` / `nn.Linear`. See `docs/deployment.md` §
-"Quantization" for tested combinations (bitsandbytes, GPTQ, torchao).
+Yes: `HydraLMForCausalLM` in `hydralm.deploy`.
 
-### Is the Hugging Face export two-way?
+It supports:
 
-One-way only. `hydralm.deploy.hf_adapter.export_to_hf` writes a HF-
-compatible checkpoint. There is no `from_hf` because the HF archive
-contains metadata (tokenizer, generation config) we don't round-trip.
-Use `HydraLM.from_pretrained` to reload a HydraLM-native checkpoint.
+- a `transformers`-shaped `forward(...)`
+- recurrent `generate(...)`
+- `save_pretrained(...)`
+- `from_pretrained(...)`
 
-### What's the smallest useful model size?
+### Is the HuggingFace adapter export two-way?
 
-`d_model=256`, `n_layers=6` (~15M params) is the smoke-test
-configuration in `scripts/train_tiny.py`. It learns the
-TinyShakespeare corpus in minutes but has no zero-shot ability. For
-actual downstream use, 125M–400M is the useful range for research;
-see `docs/benchmarks.md`.
-
----
+`HydraLMForCausalLM.from_pretrained(...)` reloads checkpoints written by
+`HydraLMForCausalLM.save_pretrained(...)`. It is not a generic loader for
+trainer `.pt` checkpoints.
 
 ## Fact bank
 
-### How big can the fact bank be?
+### What is the FactBank for?
 
-In GPU memory: bounded by `capacity * dim * dtype_bytes`. At
-`capacity=1_000_000`, `dim=768`, fp16: ~1.5 GB. Beyond that, use
-`bank.to_cpu()` and accept a latency hit, or swap in a FAISS index
-via `bank.set_backend(...)`.
+`FactBank` is an explicit key-value memory you control programmatically.
+Use it when you know what facts should be written and queried at inference
+time, rather than relying only on learned in-context retrieval.
 
-### Can I populate the bank in parallel across GPUs?
-
-Yes, using any DDP pattern. The bank itself is not distributed
-(single-GPU, single-process), but its `write()` method is thread-
-safe — in a DDP setup, each rank can own a shard of the bank and
-broadcast queries.
-
-### Does the bank survive `torch.save` / `torch.load`?
-
-Use `bank.state_dict()` and `bank.load_state_dict()` explicitly. A
-raw `torch.save(bank)` saves device-specific tensors that may not
-load cleanly on a different GPU topology.
-
----
-
-## Contributing and help
+## Contributing
 
 ### Where do I file a bug?
 
-`https://github.com/byte271/hydralm/issues`. Please include your
-PyTorch version, CUDA version, a minimal reproduction, and the
-commit hash of HydraLM you are using (`hydralm.__version__`).
+[GitHub Issues](https://github.com/byte271/HydraLM/issues)
 
-### How do I propose a new claim or benchmark?
+### How do I propose a new benchmark or claim?
 
-Open a PR at `https://github.com/byte271/hydralm/pulls` that adds:
+Open a PR that adds:
 
-1. A script under `scripts/` that can be run by a stranger in under
-   an hour.
-2. A test under `tests/` that gates the pass threshold.
-3. An entry in `docs/claims.md` that links the two.
+1. a reproducible script under `scripts/`
+2. the matching test coverage under `tests/`
+3. the corresponding documentation in `docs/claims.md`
 
-See `CONTRIBUTING.md` for the full workflow.
+Pull requests go to:
+[byte271/HydraLM](https://github.com/byte271/HydraLM/pulls)

@@ -1,168 +1,207 @@
 # Deployment Guide
 
-This document covers inference-time deployment of HydraLM: loading a
-trained checkpoint, running single-token and streaming generation,
-exporting to Hugging Face format, and compiling a latency-optimized
-graph with `torch.compile`.
+This document covers the deployment-facing APIs that exist in the current
+HydraLM codebase: loading raw training checkpoints, generating with the
+native recurrent path, using `StreamingEngine`, speculative decoding,
+the compiled batched decoder, and the HuggingFace-shaped adapter.
 
-## Loading a checkpoint
+## Loading a native HydraLM checkpoint
 
-```python
-from hydralm import HydraLM
-
-model = HydraLM.from_pretrained("checkpoints/step-50000").cuda().eval()
-```
-
-`from_pretrained` reads `config.json` + `pytorch_model.bin` (or
-`model.safetensors`) from the given directory or Hugging Face Hub
-repo id (e.g. `"byte271/hydralm-160m"`).
-
-## Single-shot generation
+`HydraLM` itself does **not** currently expose `from_pretrained`. The
+training stack writes `.pt` checkpoints containing model, optimizer,
+scheduler, and step state, so the native reload flow is:
 
 ```python
 import torch
-from hydralm import HydraLM, generate
+from hydralm import HydraConfig, HydraLM
 
-model = HydraLM.from_pretrained("byte271/hydralm-160m").cuda().eval()
+cfg = HydraConfig(
+    vocab_size=32_000,
+    d_model=768,
+    n_layers=12,
+    n_heads=12,
+)
 
-input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
+model = HydraLM(cfg)
+ckpt = torch.load("checkpoints/step_10000.pt", map_location="cpu", weights_only=True)
+model.load_state_dict(ckpt["model"])
+model = model.eval()
+```
+
+Important: the trainer checkpoint does not save `HydraConfig` for you, so
+you must recreate the same config (or save it separately in your own
+training pipeline).
+
+## Single-shot generation
+
+Use `hydralm.generate` for standard autoregressive generation:
+
+```python
+import torch
+from hydralm import generate
+
+input_ids = torch.tensor([[1, 2, 3, 4]])
 out = generate(
-    model, input_ids,
+    model,
+    prompt_ids=input_ids,
     max_new_tokens=128,
     temperature=0.8,
     top_p=0.9,
 )
-# out: (1, 4 + 128) tensor of token ids
 ```
 
-`generate` internally uses the incremental decoding path, so memory
-and FLOPs per token are O(state) — independent of the total number of
-tokens produced.
+`generate` uses HydraLM's recurrent `step` path internally, so per-token
+memory stays bounded by the model state rather than growing with output
+length.
 
 ## Streaming generation
 
-For interactive applications, use `hydralm.streaming.stream` to
-receive one token at a time:
+For long-context prefill and chunked processing, use `StreamingEngine`:
 
 ```python
-from hydralm.streaming import stream
+from hydralm.streaming import StreamingEngine
 
-for tok in stream(model, input_ids, max_new_tokens=256, temperature=0.8):
-    print(tokenizer.decode([tok]), end="", flush=True)
+engine = StreamingEngine(model, chunk_size=4096)
+
+# Prefill-only pass that keeps memory bounded and returns stats.
+stats = engine.process(long_input_ids)
+print(stats.summary())
+
+# Prefill the prompt and continue decoding.
+generated = engine.extend_and_generate(
+    prompt=long_input_ids,
+    max_new_tokens=128,
+    temperature=0.7,
+    top_k=50,
+)
 ```
 
-The generator yields integers; wrap it with your tokenizer of choice.
+If you need logits per chunk instead of a summary or decoded tokens, use
+`engine.stream(token_chunks)`.
 
 ## Speculative decoding
 
-Speculative decoding accelerates generation by having a small **draft
-model** propose `k` tokens, which the larger **target model** then
-verifies in a single parallel forward pass. HydraLM ships a reference
-implementation in `hydralm.spec_decoding`:
+HydraLM ships an exact speculative decoding implementation in
+`hydralm.spec_decoding`.
+
+### External draft model
 
 ```python
-from hydralm import speculative_generate, HydraLM
+from hydralm import speculative_generate
 
-draft  = HydraLM.from_pretrained("byte271/hydralm-60m").cuda().eval()
-target = HydraLM.from_pretrained("byte271/hydralm-160m").cuda().eval()
-
-out = speculative_generate(
-    draft, target, input_ids,
+generated, stats = speculative_generate(
+    target=target_model,
+    draft=draft_model,
+    prompt_ids=input_ids,
     max_new_tokens=256,
-    draft_k=4,
+    k=4,
 )
 ```
 
-Expected speedup on matched hardware:
+### MTP self-drafting
 
-| Setup                               | Tokens / s | Speedup |
-| ----------------------------------- | ---------- | ------- |
-| Target only (160M)                  | 180        | 1.0×    |
-| Draft (60M) + Target (160M), `k=4`  | 320        | 1.8×    |
-| Draft (60M) + Target (160M), `k=8`  | 360        | 2.0×    |
-
-`k` beyond 8 tends to hit diminishing returns; see
-`docs/benchmarks.md`.
-
-## Compiled inference graph
-
-For minimum-latency deployment, compile the step function once:
+If the checkpoint was trained with `cfg.mtp_depth > 0`, the model can
+serve as both draft and target:
 
 ```python
-from hydralm.deploy.compiled import compile_for_inference
-
-step_fn = compile_for_inference(model, batch_size=1, max_length=4096)
-
-# Reuse `step_fn` across many requests. First call warms up the graph.
-out = step_fn(input_ids, state=None)
+generated, stats = speculative_generate(
+    target=model,
+    draft=model,
+    prompt_ids=input_ids,
+    max_new_tokens=256,
+    k=model.cfg.mtp_depth,
+)
 ```
 
-`compile_for_inference` is a thin wrapper around `torch.compile` with
-mode `"reduce-overhead"` and CUDA graphs enabled. It typically shaves
-15–25% off per-token latency on A100 for sequence lengths up to
-~64k.
+The speculative decoder returns `(generated_ids, stats)`, where `stats`
+tracks proposals, acceptances, and rounds.
 
-Because CUDA graphs require static shapes, the compiled `step_fn`
-accepts one token per call. If you need batched inference with
-different sequence lengths, use the eager path — the speedup of CUDA
-graphs does not survive dynamic shapes.
+## Retrieval Attention and bounded-memory serving
 
-## Hugging Face transformers export
-
-Every HydraLM checkpoint can be loaded by `transformers.AutoModel`
-through a thin adapter:
+Retrieval layers keep a growing chunk bank during streaming inference. If
+you need bounded-memory serving over very long streams, pair the attention
+path with `CompressiveMemory`:
 
 ```python
-from hydralm.deploy.hf_adapter import export_to_hf
+from hydralm import CompressiveMemory
 
-export_to_hf(
-    checkpoint="checkpoints/step-50000",
-    output_dir="hf/hydralm-160m",
-)
-
-# Afterwards:
-from transformers import AutoModelForCausalLM, AutoTokenizer
-model = AutoModelForCausalLM.from_pretrained(
-    "hf/hydralm-160m", trust_remote_code=True,
+mem = CompressiveMemory(
+    head_dim=model.cfg.head_dim,
+    n_heads=model.cfg.n_heads,
+    exact_window=model.cfg.retrieval_chunk_size,
+    compress_every=4,
+    n_summary=256,
 )
 ```
 
-The exported directory contains `config.json`, a `model.safetensors`
-shard, and a small `modeling_hydralm.py` file that registers the
-model with the `transformers` auto-classes. `trust_remote_code=True`
-is required because HydraLM defines a custom architecture not present
-in upstream `transformers`.
+`CompressiveMemory` is framework-agnostic: it transforms raw `(B, H, L, Dh)`
+key/value streams, so you can integrate it anywhere you already manage
+attention K/V tensors.
+
+## Compiled batched decoding
+
+For low-latency batched token generation, use `CompiledDecoder` and
+`Request` from `hydralm.deploy`:
+
+```python
+from hydralm.deploy import CompiledDecoder, Request
+
+decoder = CompiledDecoder(model, compile=True)
+reqs = [
+    Request(prompt=input_ids[0], max_new_tokens=64, temperature=0.8),
+]
+decoded = decoder.decode(reqs)
+```
+
+Key behavior:
+
+- `prefill(reqs)` runs the prompt pass per request and stashes recurrent state
+- `step_batch(reqs)` advances every active request by one token
+- `decode(reqs)` runs prefill plus the full decode loop
+
+Batching constraint: requests must have the same prompt length at prefill
+time so the SWA caches line up cleanly across the batch dimension. In
+practice that means bucketing requests by prompt length.
+
+## HuggingFace-shaped adapter
+
+If you want a `transformers`-style surface, use `HydraLMForCausalLM`:
+
+```python
+from hydralm.deploy import HydraLMForCausalLM
+
+hf_model = HydraLMForCausalLM(cfg)
+hf_model.model.load_state_dict(model.state_dict())
+hf_model.save_pretrained("hf/hydralm-160m")
+
+reloaded = HydraLMForCausalLM.from_pretrained("hf/hydralm-160m")
+```
+
+This adapter supports:
+
+- `forward(...)` returning a `CausalLMOutput`-compatible object
+- `generate(...)` delegating to HydraLM's native recurrent generator
+- `save_pretrained(...)` / `from_pretrained(...)` for adapter-native checkpoints
+- embedding resize/tie helpers expected by downstream tooling
+
+`HydraLMForCausalLM.from_pretrained(...)` reloads checkpoints produced by
+`HydraLMForCausalLM.save_pretrained(...)`; it is not a generic loader for
+arbitrary trainer `.pt` checkpoints.
 
 ## Quantization
 
-HydraLM is compatible with standard PyTorch post-training
-quantization libraries. We have tested:
+HydraLM stays in pure PyTorch, so standard post-training quantization stacks
+that operate on `nn.Linear` modules can be layered on top. The repository
+does not currently expose a first-party quantization wrapper.
 
-- **bitsandbytes 4-bit NF4**: ~3.4× memory reduction, <1% quality
-  drop at 160M.
-- **GPTQ 4-bit** via `auto_gptq`: similar memory / quality tradeoff,
-  ~10% faster inference because it fuses the dequant kernel.
-- **INT8 weight-only via `torchao`**: ~2× memory reduction, ~5%
-  faster inference, negligible quality drop.
+## Practical serving notes
 
-Quantization hooks live in the downstream libraries, not in this
-repo — we keep HydraLM in pure PyTorch so every quantization stack
-that speaks `nn.Linear` works out of the box.
+1. Use `generate` for the simplest path.
+2. Use `StreamingEngine` when the prompt is large or comes in chunks.
+3. Use `CompiledDecoder` when you want low-latency batched token serving.
+4. Bucket requests by prompt length before `CompiledDecoder.prefill`.
+5. Use the HF adapter only when you specifically need a Transformers-shaped
+   wrapper or adapter-native save/load behavior.
 
-## Serving
-
-For high-throughput serving:
-
-1. Use `compile_for_inference` with a fixed batch size per replica.
-2. Pin the model to a single GPU and use CPU-side request batching
-   with a queue — HydraLM's per-step compute is small enough that
-   batching 4–16 requests saturates a single A100.
-3. If using speculative decoding, keep the draft model co-resident
-   on the same GPU; the inter-GPU synchronization cost dominates
-   otherwise.
-
-A minimal FastAPI example that wires all three together is in
-`scripts/online_learning_demo.py`.
-
-See `docs/api.md` for exact function signatures and
-`docs/faq.md` for common deployment issues.
+See `docs/api.md` for exact signatures, `docs/retrieval.md` for the long-range
+stack, and `docs/faq.md` for troubleshooting.

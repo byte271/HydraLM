@@ -1,170 +1,222 @@
 # Training Guide
 
-This document covers how to train a HydraLM from scratch or fine-tune
-a checkpoint. The reference implementation is in
-`hydralm/training/trainer.py` and the minimal demo script is
-`scripts/train_tiny.py`.
+This document covers the training APIs that exist in the current HydraLM
+codebase: the minimal `train_tiny.py` script, the built-in `Trainer`, mixed
+precision, optimizer choices, FSDP integration, checkpointing, and the
+optional MTP loss path.
 
-## Quick start: train a tiny model on TinyShakespeare
+## Quick start: `train_tiny.py`
+
+The fastest way to exercise the full training stack is the character-level
+demo script:
 
 ```bash
-# From the repository root.
-pip install -e .[dev]
+cd research/hydralm
+
 python scripts/train_tiny.py \
     --data data/tinyshakespeare.txt \
-    --d-model 256 --n-layers 6 --n-heads 4 \
-    --seq-len 1024 --batch-size 16 \
-    --steps 2000 --lr 3e-4 \
-    --save checkpoints/tiny
+    --steps 2000 \
+    --batch-size 16 \
+    --seq-len 512 \
+    --d-model 256 \
+    --n-layers 6 \
+    --n-heads 4 \
+    --optimizer adamw
 ```
 
-On a single A100 this reaches ~1.7 bits per byte (≈2.5 val loss in
-nats) in under 10 minutes. Checkpoints are written with
-`HydraLM.save_pretrained`; reload them with `HydraLM.from_pretrained`.
+If you want the hybrid optimizer path instead, switch to:
 
-## The training loop
+```bash
+python scripts/train_tiny.py \
+    --data data/tinyshakespeare.txt \
+    --optimizer muon \
+    --muon-lr 5e-3
+```
 
-The reference trainer is intentionally minimal — around 200 lines —
-and is meant to be copied and modified rather than configured to
-death.
+The script instantiates `HydraConfig`, builds `HydraLM`, chooses either
+plain AdamW or the hybrid Muon optimizer, and runs a compact training loop
+with sampling checkpoints printed to stdout.
+
+## Built-in trainer
+
+The reference trainer lives in `hydralm/training/trainer.py` and is driven by
+`TrainingConfig`, not `TrainerConfig`.
 
 ```python
-import torch
-from hydralm import HydraLM, HydraConfig
-from hydralm.training.trainer import Trainer, TrainerConfig
+from hydralm import HydraConfig, HydraLM
+from hydralm.training.trainer import TrainingConfig, Trainer
 
 cfg = HydraConfig(
-    vocab_size=50257, d_model=768, n_layers=12, n_heads=12,
-    seq_len=2048, swa_window=256,
+    vocab_size=32_000,
+    d_model=768,
+    n_layers=12,
+    n_heads=12,
+    swa_window=512,
 )
-model = HydraLM(cfg).cuda()
+model = HydraLM(cfg)
 
-tcfg = TrainerConfig(
+tcfg = TrainingConfig(
+    steps=10_000,
+    batch_size=8,
+    grad_accum=1,
     lr=3e-4,
-    betas=(0.9, 0.95),
+    min_lr=3e-5,
+    warmup_steps=500,
     weight_decay=0.1,
-    grad_clip=1.0,
-    warmup_steps=1_000,
-    total_steps=50_000,
-    precision="bfloat16",
-    compile=True,
+    mixed_precision="auto",
+    optimizer="adamw",
+    compile=False,
 )
-trainer = Trainer(model, tcfg)
 
-for step, (inp, tgt) in enumerate(loader):
-    loss = trainer.step(inp.cuda(), tgt.cuda())
-    if step % 100 == 0:
-        print(f"step {step:>6}  loss {loss:.4f}")
+trainer = Trainer(model, tcfg)
+trainer.fit(data_iterable)
 ```
 
-## Optimizer: Muon + AdamW
+What the trainer currently provides:
 
-HydraLM uses the hybrid **Muon + AdamW** optimizer
-(`hydralm.optim.HybridMuonAdamW`) by default. It applies:
+- gradient accumulation
+- cosine decay with warmup
+- gradient clipping
+- optional `torch.compile`
+- optional gradient checkpointing
+- optional FSDP when launched under distributed execution
+- periodic logging, evaluation callbacks, and checkpoint saves
 
-- **Muon** (Jordan et al., 2024) to the 2-D matrix parameters of
-  every linear layer inside each block — this is where Muon's
-  orthogonalization step is helpful.
-- **AdamW** to everything else: embeddings, LM head, RMSNorm
-  weights, biases, and any 1-D or 0-D parameter.
+## Optimizer options
 
-Muon typically yields a 1.2–1.6× wall-clock speedup at matched loss
-versus AdamW-only. If your hardware does not support the Newton-Schulz
-iteration efficiently (older GPUs, CPU), pass `optimizer="adamw"` to
-`TrainerConfig` to fall back to standard AdamW.
+`TrainingConfig.optimizer` accepts:
 
-## Precision
+- `"adamw"` — the default trainer path
+- `"muon"` — hybrid Muon for 2-D matrices plus AdamW for the rest
 
-Three precision modes are supported and selected with
-`TrainerConfig.precision`:
+If you want to construct the hybrid optimizer directly:
 
-| Mode         | Weights  | Compute           | Grad state |
-| ------------ | -------- | ----------------- | ---------- |
-| `"float32"`  | fp32     | fp32              | fp32       |
-| `"bfloat16"` | fp32     | bfloat16 autocast | fp32       |
-| `"fp16"`     | fp32     | fp16 + GradScaler | fp32       |
+```python
+from hydralm.optim import build_hybrid_optimizer
 
-**`bfloat16` is the recommended default** on Ampere+. HydraLM is
-numerically insensitive to bf16 in the compute path because the
-delta-rule accumulator `S` is internally upcast to fp32 (see
-`docs/theory.md` §4).
+optim = build_hybrid_optimizer(
+    model,
+    muon_lr=5e-3,
+    muon_momentum=0.95,
+    adamw_lr=3e-4,
+    adamw_betas=(0.9, 0.95),
+    adamw_weight_decay=0.1,
+)
+```
+
+The trainer uses the same helper internally when `optimizer="muon"`.
+
+## Mixed precision
+
+`TrainingConfig.mixed_precision` supports:
+
+- `"auto"`
+- `"bf16"`
+- `"fp16"`
+- `"none"`
+
+`"auto"` picks bf16 when supported on CUDA, falls back to fp16 on CUDA
+otherwise, and disables autocast on CPU.
+
+Because the delta-rule recurrence is sensitive to low-precision accumulation,
+bf16 is the safer mixed-precision option when your hardware supports it.
 
 ## Learning-rate schedule
 
-The default schedule is a cosine decay with linear warmup, defined in
-`TrainerConfig`:
+The trainer uses a linear warmup followed by cosine decay:
 
-- Warmup: `0 → lr` linearly over `warmup_steps`.
-- Decay:  `lr → lr * min_lr_ratio` as cosine over the remaining
-  `total_steps - warmup_steps`.
+- warmup from `0` to `lr` over `warmup_steps`
+- cosine decay from `lr` to `min_lr` over the remaining training steps
 
-`min_lr_ratio` defaults to `0.1`, matching the Chinchilla protocol.
-For small runs (`total_steps < 5_000`) we recommend a constant LR
-after warmup.
+The relevant fields are:
 
-## Gradient clipping and weight decay
+- `lr`
+- `min_lr`
+- `warmup_steps`
+- `steps`
 
-- `grad_clip=1.0` is always on.
-- Weight decay is **not** applied to:
-  - embeddings (`embed_tokens.weight`),
-  - LM head (tied to embeddings anyway),
-  - any `RMSNorm` weight,
-  - any bias,
-  - any gate/scaling scalar inside `GatedDeltaNet`.
+## Distributed training and FSDP
 
-The trainer does the bucketing for you; see
-`Trainer._build_param_groups`.
+The trainer checks the distributed environment automatically. When launched
+under `torchrun` and `use_fsdp=True`, it wraps the model in
+`FullyShardedDataParallel`.
 
-## Distributed training
+That means the built-in training path is:
 
-The reference trainer supports single-node DDP out of the box:
+- single-process / single-device when no distributed environment is present
+- FSDP-backed when the process group is available and `use_fsdp=True`
 
-```bash
-torchrun --nproc-per-node=8 scripts/train_tiny.py \
-    --d-model 1024 --n-layers 24 --batch-size 8 ...
-```
-
-The `Trainer` will detect DDP automatically via
-`torch.distributed.is_initialized()` and wrap the model with
-`DistributedDataParallel` using `gradient_as_bucket_view=True`.
-
-FSDP is *not* built in — HydraLM's target scale is sub-billion
-parameters, which comfortably fits in a single GPU's memory under
-bf16. If you need FSDP you should use your own training framework
-(Lightning, `nanotron`, `torchtitan`) and simply import `HydraLM` and
-`HybridMuonAdamW` from this package.
+Gradient checkpointing is separate and controlled by `grad_checkpoint`.
 
 ## Checkpointing
 
-```python
-# Save.
-model.save_pretrained("checkpoints/step-10000")
-# -> creates config.json + pytorch_model.bin
+The built-in trainer saves `.pt` checkpoints containing:
 
-# Load.
-from hydralm import HydraLM
-model = HydraLM.from_pretrained("checkpoints/step-10000").cuda()
+- `step`
+- `model`
+- `optim`
+- `sched`
+
+The save path is controlled by:
+
+- `checkpoint_dir`
+- `save_every`
+
+Reloading a native checkpoint looks like this:
+
+```python
+import torch
+from hydralm import HydraConfig, HydraLM
+
+cfg = HydraConfig(...)
+model = HydraLM(cfg)
+
+state = torch.load("checkpoints/step_2000.pt", map_location="cpu", weights_only=True)
+model.load_state_dict(state["model"])
 ```
 
-See `docs/api.md` for the full serialization format, and
-`hydralm/deploy/hf_adapter.py` for how to export the same checkpoint
-as a Hugging Face transformers model.
+The trainer checkpoint does not currently persist `HydraConfig`, so keep your
+config alongside the checkpoint in your own training workflow.
 
-## Common pitfalls
+## MTP auxiliary loss
 
-- **NaNs after a few hundred steps** — almost always means the
-  delta-rule accumulator is being run in fp16 somewhere. Check that
-  you are using `precision="bfloat16"` or `"float32"`, not `"fp16"`
-  without a scaler, and that any `@torch.autocast` context you add
-  does not include `dtype=torch.float16`.
+When `cfg.mtp_depth > 0`, the model can emit an auxiliary next-k loss during
+training:
 
-- **Loss plateaus at ~`log(vocab_size)`** — the LM head is not tied
-  to the embeddings, or your tokenizer mismatches the vocab_size in
-  `HydraConfig`. Verify `cfg.vocab_size == tokenizer.vocab_size`.
+```python
+import torch.nn.functional as F
 
-- **Slow training** — make sure `compile=True` in `TrainerConfig`
-  and that you are on PyTorch ≥ 2.4. The first iteration is slow
-  (compile) but every subsequent iteration should hit ~85% MFU on an
-  A100 at `seq_len=2048`.
+out = model(input_ids, compute_mtp=True)
+loss = F.cross_entropy(
+    out["logits"][:, :-1].reshape(-1, cfg.vocab_size),
+    input_ids[:, 1:].reshape(-1),
+    ignore_index=-100,
+)
+if out["mtp_aux_loss"] is not None:
+    loss = loss + out["mtp_aux_loss"]
+```
 
-See `docs/faq.md` for more troubleshooting.
+`out["mtp_aux_loss"]` is already scaled by `cfg.mtp_loss_weight`.
+
+## Retrieval-aware training notes
+
+Retrieval layers do not require a separate training loop. Once scheduled via
+`retrieval_every` or `layer_types`, they train like any other block in the
+backbone.
+
+Two practical knobs matter most:
+
+1. `retrieval_chunk_size` controls routing granularity.
+2. `retrieval_top_k` controls how much distant context each query chunk sees.
+
+## Common failure modes
+
+- If you see NaNs, start by checking your precision mode.
+- If long runs are too memory-heavy, try `grad_checkpoint=True`.
+- If you want the hybrid optimizer, make sure `optimizer="muon"` is set;
+  plain AdamW is the default.
+- If you need exact trainer field names, follow `TrainingConfig` in
+  `hydralm/training/trainer.py` rather than older examples.
+
+See `docs/api.md` for signatures, `docs/deployment.md` for inference-time
+usage, and `docs/faq.md` for troubleshooting.
