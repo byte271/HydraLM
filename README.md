@@ -20,7 +20,6 @@ This repository packages the full HydraLM project in one place:
 
 - the installable Python package under [`research/hydralm/`](./research/hydralm/)
 - the long-form technical docs under [`research/hydralm/docs/`](./research/hydralm/docs/)
-- the static website in [`website/`](./website/)
 - the reproducibility and claims infrastructure used to ground published behavior
 
 If you want the fastest entry point, start with the package README at
