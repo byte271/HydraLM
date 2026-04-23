@@ -138,16 +138,6 @@ The long-form docs are organized by topic:
 - Theory: [`research/hydralm/docs/theory.md`](./research/hydralm/docs/theory.md)
 - Training: [`research/hydralm/docs/training.md`](./research/hydralm/docs/training.md)
 
-## Website
-
-The static site in [`website/`](./website/) is intentionally simple:
-
-- [`website/index.html`](./website/index.html) is the polished landing page
-- [`website/docs.html`](./website/docs.html) is the browser-oriented docs shell
-
-Both pages link back to the Markdown sources in
-[`research/hydralm/`](./research/hydralm/), so the repository stays the source
-of truth.
 
 ## License and citation
 
