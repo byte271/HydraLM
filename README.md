@@ -67,8 +67,6 @@ python scripts/reproduce_claims.py --budget paper --out RESULTS.md
 | If you want to... | Start here |
 | --- | --- |
 | Understand the package and workflows | [`research/hydralm/README.md`](./research/hydralm/README.md) |
-| Browse the browser-friendly docs shell | [`website/docs.html`](./website/docs.html) |
-| See the landing page / project overview | [`website/index.html`](./website/index.html) |
 | Understand the hybrid model design | [`research/hydralm/docs/architecture.md`](./research/hydralm/docs/architecture.md) |
 | Dive into retrieval, memory, and MTP | [`research/hydralm/docs/retrieval.md`](./research/hydralm/docs/retrieval.md) |
 | Review benchmarks and formal claims | [`research/hydralm/docs/claims.md`](./research/hydralm/docs/claims.md) |
