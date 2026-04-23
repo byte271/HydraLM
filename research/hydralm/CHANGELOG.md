@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Formal verification record in `docs/benchmarks.md` for the staged v0.3.0
+  validation pass, including:
+  - local Windows CPU environment details,
+  - executed verification commands,
+  - pytest results,
+  - smoke-budget and paper-budget claim reproducer results,
+  - CPU length-scaling sanity-check numbers,
+  - million-token streaming demo results, and
+  - retrieval-path execution notes.
+
+### Changed
+- Refreshed source-of-truth documentation to better match the currently
+  exercised code paths and validation workflow:
+  - `docs/deployment.md`
+  - `docs/training.md`
+  - `docs/faq.md`
+  - `docs/glossary.md`
+- Clarified in `docs/benchmarks.md` that the newly recorded local run is a
+  Windows CPU validation pass and does not replace the canonical GPU-facing
+  benchmark tables later in the document.
+
+### Notes
+- The validation record documents a local environment where:
+  - 76 pytest cases passed,
+  - the `HydraLMForCausalLM` save/load round-trip was manually reproduced
+    inside the workspace after the fixture-backed pytest variant hit a
+    Windows temporary-directory sandbox restriction, and
+  - both smoke and paper claim reproducer budgets completed successfully.
+
 ### Planned
 - Fused CUDA / Triton kernel for the gated delta-rule recurrence (currently
   the chunkwise kernel runs a tight PyTorch loop inside each chunk).
